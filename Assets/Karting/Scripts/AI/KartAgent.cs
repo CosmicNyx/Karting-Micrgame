@@ -1,9 +1,7 @@
 ﻿using KartGame.KartSystems;
 using Unity.MLAgents;
 using Unity.MLAgents.Sensors;
-using Unity.MLAgents.Actuators;
 using UnityEngine;
-using Random = UnityEngine.Random;
 
 namespace KartGame.AI
 {
@@ -15,8 +13,7 @@ namespace KartGame.AI
     public struct Sensor
     {
         public Transform Transform;
-        public float RayDistance;
-        public float HitValidationDistance;
+        public float HitThreshold;
     }
 
     /// <summary>
@@ -35,6 +32,12 @@ namespace KartGame.AI
     /// </summary>
     public class KartAgent : Agent, IInput
     {
+        /// <summary>
+        /// How many actions are we going to support when we use our own custom heuristic? Right now we want the X/Y
+        /// axis for acceleration and steering.
+        /// </summary>
+        const int k_LocalActionSize = 2;
+
 #region Training Modes
         [Tooltip("Are we training the agent or is the agent production ready?")]
         public AgentMode Mode = AgentMode.Training;
@@ -44,7 +47,8 @@ namespace KartGame.AI
 #endregion
 
 #region Senses
-        [Header("Observation Params")]
+        [Header("Observation Params"), Tooltip("How far should the agent shoot raycasts to detect the world?")]
+        public float RaycastDistance;
         [Tooltip("What objects should the raycasts hit and detect?")]
         public LayerMask Mask;
         [Tooltip("Sensors contain ray information to sense out the world, you can have as many sensors as you need.")]
@@ -69,11 +73,9 @@ namespace KartGame.AI
         public float TowardsCheckpointReward;
         [Tooltip("Typically if the agent moves faster, we want to reward it for finishing the track quickly.")]
         public float SpeedReward;
-        [Tooltip("Reward the agent when it keeps accelerating")]
-        public float AccelerationReward;
-        #endregion
+#endregion
 
-        #region ResetParams
+#region ResetParams
         [Header("Inference Reset Params")]
         [Tooltip("What is the unique mask that the agent should detect when it falls out of the track?")]
         public LayerMask OutOfBoundsMask;
@@ -89,13 +91,10 @@ namespace KartGame.AI
 #endregion
 
         ArcadeKart m_Kart;
-        bool m_Acceleration;
-        bool m_Brake;
+        float m_Acceleration;
         float m_Steering;
+        float[] m_LocalActions;
         int m_CheckpointIndex;
-
-        bool m_EndEpisode;
-        float m_LastAccumulatedReward;
 
         void Awake()
         {
@@ -105,21 +104,12 @@ namespace KartGame.AI
 
         void Start()
         {
+            m_LocalActions = new float[k_LocalActionSize];
+
             // If the agent is training, then at the start of the simulation, pick a random checkpoint to train the agent.
             OnEpisodeBegin();
 
             if (Mode == AgentMode.Inferencing) m_CheckpointIndex = InitCheckpointIndex;
-        }
-
-        void Update()
-        {
-            if (m_EndEpisode)
-            {
-                m_EndEpisode = false;
-                AddReward(m_LastAccumulatedReward);
-                EndEpisode();
-                OnEpisodeBegin();
-            }
         }
 
         void LateUpdate()
@@ -131,7 +121,7 @@ namespace KartGame.AI
                         Debug.DrawRay(transform.position, Vector3.down * GroundCastDistance, Color.cyan);
 
                     // We want to place the agent back on the track if the agent happens to launch itself outside of the track.
-                    if (Physics.Raycast(transform.position + Vector3.up, Vector3.down, out var hit, GroundCastDistance, TrackMask)
+                    if (Physics.Raycast(transform.position, Vector3.down, out var hit, GroundCastDistance, TrackMask)
                         && ((1 << hit.collider.gameObject.layer) & OutOfBoundsMask) > 0)
                     {
                         // Reset the agent back to its last known agent checkpoint
@@ -139,8 +129,7 @@ namespace KartGame.AI
                         transform.localRotation = checkpoint.rotation;
                         transform.position = checkpoint.position;
                         m_Kart.Rigidbody.velocity = default;
-                        m_Steering = 0f;
-						m_Acceleration = m_Brake = false; 
+                        m_Acceleration = m_Steering = 0f;
                     }
 
                     break;
@@ -188,6 +177,12 @@ namespace KartGame.AI
             return 0;
         }
 
+        void InterpretDiscreteActions(float[] actions)
+        {
+            m_Steering = actions[0] - 1f;
+            m_Acceleration = Mathf.FloorToInt(actions[1]) == 1 ? 1 : 0;
+        }
+
         public override void CollectObservations(VectorSensor sensor)
         {
             sensor.AddObservation(m_Kart.LocalSpeed());
@@ -195,55 +190,50 @@ namespace KartGame.AI
             // Add an observation for direction of the agent to the next checkpoint.
             var next = (m_CheckpointIndex + 1) % Colliders.Length;
             var nextCollider = Colliders[next];
-            if (nextCollider == null)
-                return;
-
             var direction = (nextCollider.transform.position - m_Kart.transform.position).normalized;
             sensor.AddObservation(Vector3.Dot(m_Kart.Rigidbody.velocity.normalized, direction));
 
             if (ShowRaycasts)
                 Debug.DrawLine(AgentSensorTransform.position, nextCollider.transform.position, Color.magenta);
 
-            m_LastAccumulatedReward = 0.0f;
-            m_EndEpisode = false;
+            var accumulatedReward = 0.0f;
+            var endEpisode = false;
             for (var i = 0; i < Sensors.Length; i++)
             {
                 var current = Sensors[i];
                 var xform = current.Transform;
                 var hit = Physics.Raycast(AgentSensorTransform.position, xform.forward, out var hitInfo,
-                    current.RayDistance, Mask, QueryTriggerInteraction.Ignore);
+                    RaycastDistance, Mask, QueryTriggerInteraction.Ignore);
 
                 if (ShowRaycasts)
                 {
-                    Debug.DrawRay(AgentSensorTransform.position, xform.forward * current.RayDistance, Color.green);
-                    Debug.DrawRay(AgentSensorTransform.position, xform.forward * current.HitValidationDistance, 
+                    Debug.DrawRay(AgentSensorTransform.position, xform.forward * RaycastDistance, Color.green);
+                    Debug.DrawRay(AgentSensorTransform.position, xform.forward * RaycastDistance * current.HitThreshold,
                         Color.red);
-
-                    if (hit && hitInfo.distance < current.HitValidationDistance)
-                    {
-                        Debug.DrawRay(hitInfo.point, Vector3.up * 3.0f, Color.blue);
-                    }
                 }
 
-                if (hit)
+                var hitDistance = (hit ? hitInfo.distance : RaycastDistance) / RaycastDistance;
+                sensor.AddObservation(hitDistance);
+
+                if (hitDistance < current.HitThreshold)
                 {
-                    if (hitInfo.distance < current.HitValidationDistance)
-                    {
-                        m_LastAccumulatedReward += HitPenalty;
-                        m_EndEpisode = true;
-                    }
+                    accumulatedReward += HitPenalty;
+                    endEpisode = true;
                 }
-
-                sensor.AddObservation(hit ? hitInfo.distance : current.RayDistance);
             }
 
-            sensor.AddObservation(m_Acceleration);
+            if (endEpisode)
+            {
+                AddReward(accumulatedReward);
+                EndEpisode();
+                OnEpisodeBegin();
+            }
         }
 
-        public override void OnActionReceived(ActionBuffers actions)
+        public override void OnActionReceived(float[] vectorAction)
         {
-            base.OnActionReceived(actions);
-            InterpretDiscreteActions(actions);
+            base.OnActionReceived(vectorAction);
+            InterpretDiscreteActions(vectorAction);
 
             // Find the next checkpoint when registering the current checkpoint that the agent has passed.
             var next = (m_CheckpointIndex + 1) % Colliders.Length;
@@ -255,7 +245,6 @@ namespace KartGame.AI
 
             // Add rewards if the agent is heading in the right direction
             AddReward(reward * TowardsCheckpointReward);
-            AddReward((m_Acceleration && !m_Brake ? 1.0f : 0.0f) * AccelerationReward);
             AddReward(m_Kart.LocalSpeed() * SpeedReward);
         }
 
@@ -269,8 +258,7 @@ namespace KartGame.AI
                     transform.localRotation = collider.transform.rotation;
                     transform.position = collider.transform.position;
                     m_Kart.Rigidbody.velocity = default;
-                    m_Acceleration = false;
-                    m_Brake = false;
+                    m_Acceleration = 0f;
                     m_Steering = 0f;
                     break;
                 default:
@@ -278,21 +266,15 @@ namespace KartGame.AI
             }
         }
 
-        void InterpretDiscreteActions(ActionBuffers actions)
+        public override void Heuristic(float[] actions)
         {
-            m_Steering = actions.DiscreteActions[0] - 1f;
-            m_Acceleration = actions.DiscreteActions[1] >= 1.0f;
-            m_Brake = actions.DiscreteActions[1] < 1.0f;
+            actions[0] = Input.GetAxis("Horizontal") + 1;
+            actions[1] = Sign(Input.GetAxis("Vertical"));
         }
 
-        public InputData GenerateInput()
+        public Vector2 GenerateInput()
         {
-            return new InputData
-            {
-                Accelerate = m_Acceleration,
-                Brake = m_Brake,
-                TurnInput = m_Steering
-            };
+            return new Vector2(m_Steering, m_Acceleration);
         }
     }
 }
